@@ -66,6 +66,8 @@ import (
 	"github.com/argoproj/argo-cd/v2/util/helm"
 	logutils "github.com/argoproj/argo-cd/v2/util/log"
 	settings_util "github.com/argoproj/argo-cd/v2/util/settings"
+
+	"github.com/perimeterx/marshmallow"
 )
 
 const (
@@ -94,6 +96,45 @@ func (a CompareWith) Max(b CompareWith) CompareWith {
 
 func (a CompareWith) Pointer() *CompareWith {
 	return &a
+}
+
+type PartialJson struct {
+	APIVersion string `json:"apiVersion"`
+	Kind       string `json:"kind"`
+	Metadata   struct {
+		Namespace string `json:"namespace"`
+		Name      string `json:"name"`
+	} `json:"metadata"`
+}
+
+func (p *PartialJson) GetAPIVersion() string {
+	return p.APIVersion
+}
+
+func (p *PartialJson) GetKind() string {
+	return p.Kind
+}
+
+func (p *PartialJson) GetNamespace() string {
+	return p.Metadata.Namespace
+}
+
+func (p *PartialJson) GetName() string {
+	return p.Metadata.Name
+}
+
+func (p *PartialJson) GroupVersionKind() schema.GroupVersionKind {
+	gv, err := schema.ParseGroupVersion(p.GetAPIVersion())
+	if err != nil {
+		return schema.GroupVersionKind{}
+	}
+	gvk := gv.WithKind(p.GetKind())
+	return gvk
+}
+
+func GetResourceKey(obj *PartialJson) kube.ResourceKey {
+	gvk := obj.GroupVersionKind()
+	return kube.NewResourceKey(gvk.Group, gvk.Kind, obj.GetNamespace(), obj.GetName())
 }
 
 // ApplicationController is the controller for application resources.
@@ -492,18 +533,20 @@ func (ctrl *ApplicationController) getResourceTree(a *appv1.Application, managed
 	for i := range managedResources {
 		managedResource := managedResources[i]
 		delete(orphanedNodesMap, kube.NewResourceKey(managedResource.Group, managedResource.Kind, managedResource.Namespace, managedResource.Name))
-		var live = &unstructured.Unstructured{}
-		err := json.Unmarshal([]byte(managedResource.LiveState), &live)
+		var live = &PartialJson{}
+		var res map[string]interface{}
+		res, err = marshmallow.Unmarshal([]byte(managedResource.LiveState), live)
 		if err != nil {
 			return nil, fmt.Errorf("failed to unmarshal live state of managed resources: %w", err)
 		}
-		var target = &unstructured.Unstructured{}
-		err = json.Unmarshal([]byte(managedResource.TargetState), &target)
-		if err != nil {
-			return nil, fmt.Errorf("failed to unmarshal target state of managed resources: %w", err)
-		}
 
-		if live == nil {
+		// if res has no items
+		if len(res) == 0 {
+			var target = &PartialJson{}
+			_, err = marshmallow.Unmarshal([]byte(managedResource.TargetState), target)
+			if err != nil {
+				return nil, fmt.Errorf("failed to unmarshal target state of managed resources: %w", err)
+			}
 			nodes = append(nodes, appv1.ResourceNode{
 				ResourceRef: appv1.ResourceRef{
 					Version:   target.GroupVersionKind().Version,
@@ -514,7 +557,7 @@ func (ctrl *ApplicationController) getResourceTree(a *appv1.Application, managed
 				},
 			})
 		} else {
-			err := ctrl.stateCache.IterateHierarchy(a.Spec.Destination.Server, kube.GetResourceKey(live), func(child appv1.ResourceNode, appName string) bool {
+			err := ctrl.stateCache.IterateHierarchy(a.Spec.Destination.Server, GetResourceKey(live), func(child appv1.ResourceNode, appName string) bool {
 				permitted, _ := proj.IsResourcePermitted(schema.GroupKind{Group: child.ResourceRef.Group, Kind: child.ResourceRef.Kind}, child.Namespace, a.Spec.Destination, func(project string) ([]*appv1.Cluster, error) {
 					clusters, err := ctrl.db.GetProjectClusters(context.TODO(), project)
 					if err != nil {
